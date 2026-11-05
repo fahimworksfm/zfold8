@@ -60,6 +60,21 @@ import fm.fahim.foldlauncher.Posture
 import fm.fahim.foldlauncher.Project
 import fm.fahim.foldlauncher.Search
 import java.time.ZoneId
+import androidx.activity.compose.rememberLauncherForActivityResult
+import androidx.activity.result.PickVisualMediaRequest
+import androidx.activity.result.contract.ActivityResultContracts
+import androidx.compose.animation.core.Animatable
+import androidx.compose.animation.core.FastOutSlowInEasing
+import androidx.compose.animation.core.tween
+import androidx.compose.runtime.State
+import androidx.compose.runtime.mutableIntStateOf
+import androidx.compose.runtime.snapshotFlow
+import androidx.compose.ui.geometry.Offset
+import androidx.compose.ui.graphics.ImageBitmap
+import androidx.compose.ui.graphics.graphicsLayer
+import fm.fahim.foldlauncher.Status
+import kotlinx.coroutines.flow.first
+import kotlinx.coroutines.launch
 
 private val Ink = Cream
 private val Muted = Dim
@@ -82,12 +97,21 @@ private val STUDIO_PACKAGES = listOf(
     "com.termux",
 )
 
+/** Settings you change in the Workshop. */
+data class Prefs(val door: Boolean = true, val tilt: Boolean = true)
+
 /** All the state and callbacks the screen needs, gathered in one place. */
 class LauncherInputs(
     val apps: List<AppEntry>,
     val hidden: Set<String>,
     val projects: List<Project>,
+    val images: Map<String, ImageBitmap?>,
     val fold: FoldingFeature?,
+    val hinge: State<Float?>,
+    val tilt: State<Offset>,
+    val doorKey: Int,
+    val prefs: Prefs,
+    val setPrefs: (Prefs) -> Unit,
     val resetTick: Int,
     val secondZone: ZoneId?,
     val onCycleZone: () -> Unit,
@@ -96,6 +120,8 @@ class LauncherInputs(
     val onLaunch: (AppEntry, Posture) -> Unit,
     val appActions: (launch: (AppEntry) -> Unit) -> AppActions,
     val garage: GarageActions,
+    val pickImage: (slot: String, uri: android.net.Uri) -> Unit,
+    val clearImage: (slot: String) -> Unit,
 )
 
 private enum class Tab { GARAGE, APPS }
@@ -117,6 +143,7 @@ fun LauncherScreen(inputs: LauncherInputs) {
     var sheet by remember { mutableStateOf<Project?>(null) }
     var editing by remember { mutableStateOf<Project?>(null) }
     var adding by remember { mutableStateOf(false) }
+    var workshop by remember { mutableStateOf(false) }
     val focus = LocalFocusManager.current
     val keyboard = LocalSoftwareKeyboardController.current
 
@@ -126,27 +153,72 @@ fun LauncherScreen(inputs: LauncherInputs) {
     }
     LaunchedEffect(inputs.resetTick) { if (inputs.resetTick > 0) reset() }
 
+    // One picker for every image slot; remembers which slot asked.
+    var pendingSlot by remember { mutableStateOf<String?>(null) }
+    val picker = rememberLauncherForActivityResult(ActivityResultContracts.PickVisualMedia()) { uri ->
+        val slot = pendingSlot
+        if (uri != null && slot != null) inputs.pickImage(slot, uri)
+        pendingSlot = null
+    }
+    val pick: (String) -> Unit = { slot ->
+        pendingSlot = slot
+        picker.launch(PickVisualMediaRequest(ActivityResultContracts.PickVisualMedia.ImageOnly))
+    }
+    val garage = GarageActions(
+        openUrl = inputs.garage.openUrl,
+        askClaude = inputs.garage.askClaude,
+        save = { p -> inputs.garage.save(p); if (sheet?.id == p.id) sheet = p },
+        delete = inputs.garage.delete,
+        visit = inputs.garage.visit,
+        pickArt = { p -> pick("bay_${p.id}") },
+        clearArt = { p -> inputs.clearImage("bay_${p.id}") },
+    )
+
+    // The garage door. It rolls up when you come back to the phone or unfold it. While you are unfolding,
+    // it follows the hinge, so it opens as fast as you open the phone.
+    val ticker = rememberTicker()
+    val doorTimed = remember { Animatable(1f) }
+    var unfolds by remember { mutableIntStateOf(0) }
+    var lastPosture by remember { mutableStateOf(posture) }
+    LaunchedEffect(posture) {
+        if (lastPosture == Posture.COVER && posture != Posture.COVER) unfolds++
+        lastPosture = posture
+    }
+    var lightsKey by remember { mutableIntStateOf(0) }
+    LaunchedEffect(inputs.doorKey, unfolds, inputs.prefs.door) {
+        if (!inputs.prefs.door) { doorTimed.snapTo(1f); lightsKey++; return@LaunchedEffect }
+        doorTimed.snapTo(0f)
+        launch {
+            snapshotFlow { doorTimed.value }.first { it > 0.45f }
+            lightsKey++
+        }
+        doorTimed.animateTo(1f, tween(if (posture == Posture.COVER) 800 else 1400, delayMillis = 120, easing = FastOutSlowInEasing))
+    }
+    val hingeOpen = inputs.hinge.value?.takeIf { posture != Posture.COVER }?.let { ((it - 40f) / 110f).coerceIn(0f, 1f) } ?: 0f
+    val door = maxOf(doorTimed.value, if (doorTimed.value < 1f) hingeOpen else 1f)
+
     val visible = inputs.apps.filter { it.key !in inputs.hidden }
     val scoreMap = inputs.scores(posture)
     val predicted = visible.filter { (scoreMap[it.key] ?: 0.0) > 0.0 }.sortedByDescending { scoreMap[it.key] }
     val studio = STUDIO_PACKAGES.mapNotNull { pkg -> visible.firstOrNull { it.component.packageName == pkg } }
     // Search covers hidden apps too, so hiding never makes an app unreachable.
     val results = if (query.isBlank()) emptyList() else Search.rank(query, inputs.apps, inputs.counts())
-    val projectHits = if (query.isBlank()) emptyList() else inputs.projects.filter {
-        it.name.contains(query.trim(), ignoreCase = true) ||
-            it.note.contains(query.trim(), ignoreCase = true) ||
-            it.host.equals(query.trim(), ignoreCase = true)
+    val q = query.trim()
+    val projectHits = if (q.isEmpty()) emptyList() else inputs.projects.filter {
+        it.name.contains(q, ignoreCase = true) || it.note.contains(q, ignoreCase = true) ||
+            it.host.equals(q, ignoreCase = true) || it.waitingOn.contains(q, ignoreCase = true) ||
+            (q.equals("waiting", true) && it.status == Status.WAITING)
     }
 
     val actions = inputs.appActions { app -> inputs.onLaunch(app, posture); reset() }
-    val openBay: (Project) -> Unit = { sheet = it }
+    val openBay: (Project) -> Unit = { garage.visit(it); sheet = it }
+    val igniteBay: (Project) -> Unit = { garage.visit(it); ignite(it, garage) }
     val addBay: () -> Unit = { adding = true }
+    val look = BayLook(inputs.images, ticker, lightsKey)
     val search: @Composable (Modifier) -> Unit = { m ->
         SearchField(
             query, { query = it },
-            onGo = {
-                results.firstOrNull()?.let(actions.launch) ?: projectHits.firstOrNull()?.let { sheet = it }
-            },
+            onGo = { results.firstOrNull()?.let(actions.launch) ?: projectHits.firstOrNull()?.let(openBay) },
             modifier = m,
         )
     }
@@ -155,82 +227,102 @@ fun LauncherScreen(inputs: LauncherInputs) {
     val clock: @Composable (Int) -> Unit = { size ->
         Column(horizontalAlignment = Alignment.CenterHorizontally) {
             if (night) NightShiftBadge() else Spacer(Modifier.height(16.dp))
-            DialClock(now, size.dp, inputs.secondZone, inputs.onCycleZone)
+            DialClock(now, ticker, size.dp, inputs.secondZone, inputs.onCycleZone, inputs.tilt)
         }
     }
+    // The bays drift a little against the background as you tilt, for depth.
+    val depth = Modifier.graphicsLayer {
+        translationX = inputs.tilt.value.x * 6.dp.toPx()
+        translationY = inputs.tilt.value.y * 6.dp.toPx()
+    }
+    val bg = inputs.images[
+        when (posture) { Posture.COVER -> "bg_cover"; Posture.OPEN -> "bg_open"; Posture.TABLETOP -> "bg_tabletop" }
+    ] ?: inputs.images["bg_open"] ?: inputs.images["bg_cover"]
 
     MaterialTheme(colorScheme = darkColorScheme(primary = Accent, surface = Color(0xFF1A1816))) {
-        Box(
-            Modifier
-                .fillMaxSize()
-                .smokeBackground(night)
-                .safeDrawingPadding()
-                .imePadding()
-        ) {
-            AnimatedContent(targetState = posture, label = "posture") { p ->
-                when (p) {
-                    Posture.COVER -> Column(Modifier.fillMaxSize().padding(horizontal = 16.dp)) {
-                        when {
-                            query.isNotBlank() -> SearchResults(projectHits, results, 4, actions, openBay, Modifier.weight(1f))
-                            showAll -> {
-                                Header("All apps", trailing = "Close") { showAll = false }
-                                AppGrid(visible, columns = 4, actions = actions, modifier = Modifier.weight(1f))
-                            }
-                            else -> {
-                                Box(Modifier.fillMaxWidth().weight(1f), contentAlignment = Alignment.Center) { clock(200) }
-                                Header("Garage")
-                                GarageRow(inputs.projects, openBay, addBay)
-                                Header(if (predicted.isEmpty()) "Studio" else "Right now", trailing = "All apps") { showAll = true }
-                                AppGrid((predicted.ifEmpty { studio }).take(4), columns = 4, actions = actions, scroll = false)
-                            }
-                        }
-                        search(Modifier.fillMaxWidth().padding(vertical = 12.dp))
-                    }
-
-                    Posture.OPEN -> Row(Modifier.fillMaxSize().padding(16.dp)) {
-                        Column(Modifier.weight(0.38f).padding(end = 20.dp), horizontalAlignment = Alignment.CenterHorizontally) {
-                            clock(250)
-                            if (studio.isNotEmpty()) {
-                                Header("Studio")
-                                AppGrid(studio.take(6), columns = 3, actions = actions, scroll = false)
-                            }
-                            Header("Right now")
-                            if (predicted.isEmpty()) LearningHint()
-                            else AppGrid(predicted.take(9), columns = 3, actions = actions, modifier = Modifier.weight(1f))
-                        }
-                        Column(Modifier.weight(0.62f)) {
-                            search(Modifier.fillMaxWidth().padding(bottom = 8.dp))
-                            if (query.isNotBlank()) {
-                                SearchResults(projectHits, results, 5, actions, openBay, Modifier.weight(1f))
-                            } else {
-                                Row(Modifier.padding(vertical = 8.dp)) {
-                                    TabLabel("GARAGE  ${inputs.projects.size}", tab == Tab.GARAGE) { tab = Tab.GARAGE }
-                                    TabLabel("APPS  ${visible.size}", tab == Tab.APPS) { tab = Tab.APPS }
+        Box(Modifier.fillMaxSize()) {
+            GarageBackdrop(night, ticker, inputs.tilt, bg)
+            Box(Modifier.fillMaxSize().safeDrawingPadding().imePadding()) {
+                AnimatedContent(targetState = posture, label = "posture") { p ->
+                    when (p) {
+                        Posture.COVER -> Column(Modifier.fillMaxSize().padding(horizontal = 16.dp)) {
+                            when {
+                                query.isNotBlank() -> SearchResults(projectHits, results, 4, actions, look, openBay, igniteBay, Modifier.weight(1f))
+                                showAll -> {
+                                    Header("All apps", trailing = "Close") { showAll = false }
+                                    AppGrid(visible, columns = 4, actions = actions, modifier = Modifier.weight(1f))
                                 }
-                                if (tab == Tab.GARAGE) GarageGrid(inputs.projects, 3, openBay, addBay, Modifier.weight(1f))
-                                else AppGrid(visible, columns = 5, actions = actions, modifier = Modifier.weight(1f))
+                                else -> {
+                                    Box(Modifier.fillMaxWidth().weight(1f), contentAlignment = Alignment.Center) { clock(200) }
+                                    Header("Garage", trailing = "Workshop") { workshop = true }
+                                    Box(depth) { GarageRow(inputs.projects, look, openBay, igniteBay, addBay) }
+                                    Header(if (predicted.isEmpty()) "Studio" else "Right now", trailing = "All apps") { showAll = true }
+                                    AppGrid((predicted.ifEmpty { studio }).take(4), columns = 4, actions = actions, scroll = false)
+                                }
+                            }
+                            search(Modifier.fillMaxWidth().padding(vertical = 12.dp))
+                        }
+
+                        Posture.OPEN -> Row(Modifier.fillMaxSize().padding(16.dp)) {
+                            Column(Modifier.weight(0.38f).padding(end = 20.dp), horizontalAlignment = Alignment.CenterHorizontally) {
+                                clock(250)
+                                if (studio.isNotEmpty()) {
+                                    Header("Studio")
+                                    AppGrid(studio.take(6), columns = 3, actions = actions, scroll = false)
+                                }
+                                Header("Right now")
+                                if (predicted.isEmpty()) LearningHint()
+                                else AppGrid(predicted.take(9), columns = 3, actions = actions, modifier = Modifier.weight(1f))
+                            }
+                            Column(Modifier.weight(0.62f)) {
+                                search(Modifier.fillMaxWidth().padding(bottom = 8.dp))
+                                if (query.isNotBlank()) {
+                                    SearchResults(projectHits, results, 5, actions, look, openBay, igniteBay, Modifier.weight(1f))
+                                } else {
+                                    Row(Modifier.padding(vertical = 8.dp), verticalAlignment = Alignment.CenterVertically) {
+                                        TabLabel("GARAGE  ${inputs.projects.size}", tab == Tab.GARAGE) { tab = Tab.GARAGE }
+                                        TabLabel("APPS  ${visible.size}", tab == Tab.APPS) { tab = Tab.APPS }
+                                        Spacer(Modifier.weight(1f))
+                                        val waiting = inputs.projects.count { it.status == Status.WAITING }
+                                        if (waiting > 0) {
+                                            Text(
+                                                "$waiting WAITING", color = Color(0xFFFFB020), fontSize = 11.sp, letterSpacing = 2.sp,
+                                                fontFamily = FontFamily.Monospace,
+                                                modifier = Modifier.clickable { query = "waiting" }.padding(end = 16.dp)
+                                            )
+                                        }
+                                        TabLabel("WORKSHOP", false) { workshop = true }
+                                    }
+                                    if (tab == Tab.GARAGE) GarageGrid(inputs.projects, 3, look, openBay, igniteBay, addBay, depth.weight(1f))
+                                    else AppGrid(visible, columns = 5, actions = actions, modifier = Modifier.weight(1f))
+                                }
                             }
                         }
-                    }
 
-                    Posture.TABLETOP -> Column(Modifier.fillMaxSize().padding(horizontal = 24.dp)) {
-                        Box(Modifier.weight(1f).fillMaxWidth(), contentAlignment = Alignment.Center) { clock(220) }
-                        Column(Modifier.weight(1f).padding(top = 12.dp)) {
-                            search(Modifier.fillMaxWidth().padding(bottom = 8.dp))
-                            if (query.isNotBlank()) SearchResults(projectHits, results, 6, actions, openBay, Modifier.weight(1f))
-                            else {
-                                GarageRow(inputs.projects, openBay, addBay)
-                                Spacer(Modifier.height(8.dp))
-                                AppGrid(predicted.ifEmpty { studio }.take(6), columns = 6, actions = actions, scroll = false)
+                        Posture.TABLETOP -> Column(Modifier.fillMaxSize().padding(horizontal = 24.dp)) {
+                            Box(Modifier.weight(1f).fillMaxWidth(), contentAlignment = Alignment.Center) { clock(220) }
+                            Column(Modifier.weight(1f).padding(top = 12.dp)) {
+                                search(Modifier.fillMaxWidth().padding(bottom = 8.dp))
+                                if (query.isNotBlank()) SearchResults(projectHits, results, 6, actions, look, openBay, igniteBay, Modifier.weight(1f))
+                                else {
+                                    Box(depth) { GarageRow(inputs.projects, look, openBay, igniteBay, addBay) }
+                                    Spacer(Modifier.height(8.dp))
+                                    AppGrid(predicted.ifEmpty { studio }.take(6), columns = 6, actions = actions, scroll = false)
+                                }
                             }
                         }
                     }
                 }
             }
 
-            sheet?.let { p -> ProjectSheet(p, inputs.garage, onEdit = { editing = p }, onDismiss = { sheet = null }) }
-            editing?.let { p -> EditProjectDialog(p, inputs.garage, onDismiss = { editing = null }) }
-            if (adding) EditProjectDialog(null, inputs.garage, onDismiss = { adding = false })
+            GarageDoor(door)
+
+            sheet?.let { p ->
+                ProjectSheet(p, garage, hasArt = inputs.images["bay_${p.id}"] != null, onEdit = { editing = p }, onDismiss = { sheet = null })
+            }
+            editing?.let { p -> EditProjectDialog(p, garage, onDismiss = { editing = null }) }
+            if (adding) EditProjectDialog(null, garage, onDismiss = { adding = false })
+            if (workshop) Workshop(inputs.images, inputs.prefs, inputs.setPrefs, pick, inputs.clearImage) { workshop = false }
         }
     }
 }
@@ -241,13 +333,15 @@ private fun SearchResults(
     apps: List<AppEntry>,
     columns: Int,
     actions: AppActions,
+    look: BayLook,
     onOpen: (Project) -> Unit,
+    onIgnite: (Project) -> Unit,
     modifier: Modifier,
 ) {
     Column(modifier) {
         if (projects.isNotEmpty()) {
             Header("Garage")
-            GarageRow(projects, onOpen, onAdd = {})
+            GarageRow(projects, look, onOpen, onIgnite, onAdd = {})
         }
         if (apps.isNotEmpty()) {
             Header("Apps")

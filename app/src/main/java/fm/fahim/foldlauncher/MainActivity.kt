@@ -22,6 +22,10 @@ import fm.fahim.foldlauncher.ui.AppActions
 import fm.fahim.foldlauncher.ui.GarageActions
 import fm.fahim.foldlauncher.ui.LauncherInputs
 import fm.fahim.foldlauncher.ui.LauncherScreen
+import fm.fahim.foldlauncher.ui.Prefs
+import androidx.compose.runtime.mutableStateMapOf
+import androidx.compose.ui.geometry.Offset
+import androidx.compose.ui.graphics.ImageBitmap
 import java.time.ZoneId
 import kotlinx.coroutines.launch
 
@@ -39,6 +43,14 @@ class MainActivity : ComponentActivity() {
     private var projects by mutableStateOf<List<Project>>(emptyList())
     private val prefs by lazy { getSharedPreferences("fold", MODE_PRIVATE) }
     private var zoneIndex by mutableStateOf(0)
+    private lateinit var imageStore: ImageStore
+    private val images = mutableStateMapOf<String, ImageBitmap?>()
+    private val hinge = mutableStateOf<Float?>(null)
+    private val tilt = mutableStateOf(Offset.Zero)
+    private var doorKey by mutableStateOf(0)
+    private var settings by mutableStateOf(Prefs())
+    private var stoppedAt = 0L
+    private lateinit var motion: Motion
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
@@ -49,6 +61,13 @@ class MainActivity : ComponentActivity() {
         projectStore = ProjectStore(this)
         projects = projectStore.load()
         zoneIndex = prefs.getInt("zone", 0).coerceIn(0, ZONES.size - 1)
+        settings = Prefs(door = prefs.getBoolean("door", true), tilt = prefs.getBoolean("tilt", true))
+        imageStore = ImageStore(this)
+        lifecycleScope.launch {
+            (listOf("bg_cover", "bg_open", "bg_tabletop") + projects.map { "bay_${it.id}" })
+                .forEach { slot -> imageStore.get(slot)?.let { images[slot] = it } }
+        }
+        motion = Motion(this, onHinge = { hinge.value = it }, onTilt = { x, y -> tilt.value = Offset(x, y) })
 
         reloadApps()
         stopWatching = repo.watch { reloadApps() }
@@ -73,7 +92,18 @@ class MainActivity : ComponentActivity() {
                     apps = apps,
                     hidden = hidden,
                     projects = projects,
+                    images = images,
                     fold = fold,
+                    hinge = hinge,
+                    tilt = tilt,
+                    doorKey = doorKey,
+                    prefs = settings,
+                    setPrefs = { p ->
+                        settings = p
+                        prefs.edit().putBoolean("door", p.door).putBoolean("tilt", p.tilt).apply()
+                        motion.stop(); motion.start(p.tilt)
+                        if (!p.tilt) tilt.value = Offset.Zero
+                    },
                     resetTick = resetTick,
                     secondZone = ZONES[zoneIndex]?.let(ZoneId::of),
                     onCycleZone = {
@@ -111,8 +141,23 @@ class MainActivity : ComponentActivity() {
                         delete = { p ->
                             projects = projects.filterNot { it.id == p.id }
                             projectStore.save(projects)
+                            imageStore.clear("bay_${p.id}"); images.remove("bay_${p.id}")
                         },
+                        // Opening a bay wipes its dust and adds a mile to its odometer.
+                        visit = { p ->
+                            val now = System.currentTimeMillis()
+                            projects = projects.map { if (it.id == p.id) it.copy(visits = it.visits + 1, lastVisit = now) else it }
+                            projectStore.save(projects)
+                        },
+                        pickArt = {}, clearArt = {},
                     ),
+                    pickImage = { slot, uri ->
+                        lifecycleScope.launch {
+                            if (imageStore.put(slot, uri)) images[slot] = imageStore.get(slot)
+                            else Toast.makeText(this@MainActivity, "Couldn't read that image", Toast.LENGTH_SHORT).show()
+                        }
+                    },
+                    clearImage = { slot -> imageStore.clear(slot); images.remove(slot) },
                 )
             )
         }
@@ -139,6 +184,19 @@ class MainActivity : ComponentActivity() {
         else {
             getSystemService(ClipboardManager::class.java)?.setPrimaryClip(ClipData.newPlainText("project", text))
         }
+    }
+
+    override fun onStart() {
+        super.onStart()
+        // Back after a couple of minutes away: roll the door down and open it again.
+        if (stoppedAt != 0L && System.currentTimeMillis() - stoppedAt > 2 * 60_000) doorKey++
+        motion.start(settings.tilt)
+    }
+
+    override fun onStop() {
+        stoppedAt = System.currentTimeMillis()
+        motion.stop()
+        super.onStop()
     }
 
     override fun onNewIntent(intent: Intent) {

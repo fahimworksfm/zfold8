@@ -3,6 +3,12 @@ package fm.fahim.foldlauncher.ui
 import android.graphics.RuntimeShader
 import android.os.Build
 import androidx.compose.foundation.Canvas
+import androidx.compose.foundation.Image
+import androidx.compose.foundation.layout.Spacer
+import androidx.compose.foundation.layout.fillMaxSize
+import androidx.compose.runtime.State
+import androidx.compose.ui.graphics.ImageBitmap
+import androidx.compose.ui.layout.ContentScale
 import androidx.compose.foundation.background
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.layout.Box
@@ -14,7 +20,6 @@ import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
-import androidx.compose.runtime.mutableFloatStateOf
 import androidx.compose.runtime.mutableLongStateOf
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.setValue
@@ -74,10 +79,29 @@ fun rememberNow(): ZonedDateTime {
     return ZonedDateTime.ofInstant(Instant.ofEpochMilli(millis), ZoneId.systemDefault())
 }
 
-private const val SMOKE = """
+/**
+ * One shared clock for every animation on the home screen: smoke, dial, light strips.
+ * It ticks 20 times a second while the launcher is visible. Only drawing code reads it,
+ * so the screen redraws without rebuilding its layout.
+ */
+@Composable
+fun rememberTicker(): State<Long> {
+    val millis = remember { mutableLongStateOf(System.currentTimeMillis()) }
+    LaunchedEffect(Unit) {
+        while (true) {
+            millis.longValue = System.currentTimeMillis()
+            delay(50)
+        }
+    }
+    return millis
+}
+
+private const val GARAGE = """
 uniform float2 res;
 uniform float t;
 uniform float density;
+uniform float overlay;
+uniform float2 tilt;
 
 float hash(float2 p) { return fract(sin(dot(p, float2(127.1, 311.7))) * 43758.5453); }
 float noise(float2 p) {
@@ -92,57 +116,100 @@ float fbm(float2 p) {
     return v;
 }
 half4 main(float2 fc) {
-    float2 uv = fc / res.y;
+    float2 p = fc / res;
+    float2 uv = fc / res.y + tilt * 0.04;
+
+    // Drifting haze.
     float2 q = float2(fbm(uv * 1.4 + float2(0.0, t * 0.035)), fbm(uv * 1.4 + float2(5.2, 1.3) - t * 0.025));
     float s = fbm(uv * 1.1 + q * 1.9 + float2(t * 0.012, -t * 0.02));
-    half3 base = half3(0.050, 0.046, 0.043);
-    half3 smoke = half3(0.22, 0.20, 0.18);
-    half3 gold = half3(0.89, 0.72, 0.38);
-    half3 c = mix(base, smoke, half(smoothstep(0.38, 0.9, s) * density));
-    c += gold * half(pow(s, 7.0) * 0.55 * density);
-    float2 v = fc / res - 0.5;
-    c *= half(1.0 - dot(v, v) * 1.1);
-    return half4(c, 1.0);
+    float fog = smoothstep(0.35, 0.9, s) * density;
+
+    // Three sodium lamps in the ceiling, throwing cones of light down through the haze.
+    // Now and then one of them stutters, like an old garage tube.
+    float light = 0.0;
+    for (int i = 0; i < 3; i++) {
+        float fi = float(i);
+        float x = 0.18 + 0.32 * fi - tilt.x * 0.03;
+        float width = 0.05 + 0.32 * p.y;
+        float cone = smoothstep(width, 0.0, abs(p.x - x)) * (1.0 - p.y * 0.85);
+        float stutter = fract(t * 0.07 + fi * 0.31) > 0.985 ? 0.35 : 1.0;
+        float hot = exp(-pow(length((p - float2(x, 0.0)) * float2(1.0, 3.0)) * 9.0, 2.0));
+        light += (cone * (0.55 + fog * 1.2) + hot * 1.5) * stutter;
+    }
+
+    // Wet concrete: the bottom of the screen picks up streaks of reflected lamp light.
+    float floorMask = smoothstep(0.62, 1.0, p.y);
+    float streak = 0.0;
+    for (int i = 0; i < 3; i++) {
+        float x = 0.18 + 0.32 * float(i) + tilt.x * 0.05;
+        streak += exp(-pow((p.x - x) * 22.0, 2.0)) * (0.6 + 0.4 * noise(float2(p.x * 40.0, p.y * 6.0 - t * 0.2)));
+    }
+    streak *= floorMask * 0.5;
+
+    half3 lamp = half3(1.0, 0.76, 0.42);
+    half3 haze = half3(0.24, 0.22, 0.20);
+    half3 base = half3(0.045, 0.042, 0.040);
+    half3 c = base + haze * half(fog * 0.8) + lamp * half(light * 0.22 + streak * 0.5);
+    float2 v = p - 0.5;
+    float vignette = 1.0 - dot(v, v) * 1.2;
+
+    if (overlay > 0.5) {
+        // Over your own picture: only the haze, lamps and reflections, and a darker edge.
+        half3 add = haze * half(fog * 0.8) + lamp * half(light * 0.22 + streak * 0.5);
+        float a = clamp(fog * 0.45 + light * 0.18 + (1.0 - vignette) * 0.9, 0.0, 0.9);
+        return half4(add, half(a));
+    }
+    return half4(c * half(vignette), 1.0);
 }
 """
 
 /**
- * Slow drifting smoke behind everything, in the spirit of NeverForget's background.
- * It runs at 15 frames a second and stops whenever the launcher is out of sight.
- * Phones older than Android 13 get a plain charcoal gradient.
+ * The underground garage drawn behind everything: drifting haze, three ceiling lamps that now and then
+ * flicker, and reflections on a wet floor. With your own picture set, it draws the picture with the haze
+ * and lamps on top. Tilting the phone moves the light slightly. Night shift thickens the haze.
  */
 @Composable
-fun Modifier.smokeBackground(nightShift: Boolean): Modifier =
-    if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) smokeShaderImpl(if (nightShift) 1f else 0.6f)
-    else background(Brush.verticalGradient(listOf(Color(0xFF1A1816), Charcoal)))
-
-@androidx.annotation.RequiresApi(Build.VERSION_CODES.TIRAMISU)
-@Composable
-private fun Modifier.smokeShaderImpl(density: Float): Modifier {
-    val shader = remember { RuntimeShader(SMOKE) }
-    val brush = remember(shader) { ShaderBrush(shader) }
-    var t by remember { mutableFloatStateOf(0f) }
-    LaunchedEffect(Unit) {
-        val start = System.nanoTime()
-        while (true) {
-            t = (System.nanoTime() - start) / 1e9f
-            delay(66)
+fun GarageBackdrop(nightShift: Boolean, ticker: State<Long>, tilt: State<Offset>, image: ImageBitmap?, modifier: Modifier = Modifier) {
+    val start = remember { System.currentTimeMillis() }
+    Box(modifier.fillMaxSize().background(Charcoal)) {
+        if (image != null) {
+            Image(
+                image, contentDescription = null, contentScale = ContentScale.Crop,
+                modifier = Modifier
+                    .fillMaxSize()
+                    .graphicsLayer {
+                        // A little bigger than the screen so tilting can reveal the edges.
+                        scaleX = 1.08f; scaleY = 1.08f
+                        translationX = -tilt.value.x * 18.dp.toPx()
+                        translationY = -tilt.value.y * 18.dp.toPx()
+                    }
+            )
         }
-    }
-    return drawBehind {
-        shader.setFloatUniform("res", size.width, size.height)
-        shader.setFloatUniform("t", t)
-        shader.setFloatUniform("density", density)
-        drawRect(brush)
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
+            val shader = remember { RuntimeShader(GARAGE) }
+            val brush = remember(shader) { ShaderBrush(shader) }
+            Spacer(
+                Modifier.fillMaxSize().drawBehind {
+                    shader.setFloatUniform("res", size.width, size.height)
+                    shader.setFloatUniform("t", (ticker.value - start) / 1000f)
+                    shader.setFloatUniform("density", if (nightShift) 1f else 0.6f)
+                    shader.setFloatUniform("overlay", if (image != null) 1f else 0f)
+                    shader.setFloatUniform("tilt", tilt.value.x, tilt.value.y)
+                    drawRect(brush)
+                }
+            )
+        } else if (image == null) {
+            Spacer(Modifier.fillMaxSize().background(Brush.verticalGradient(listOf(Color(0xFF1A1816), Charcoal))))
+        }
     }
 }
 
 /**
- * A dial clock tilted back a little for depth. The gold ticks fill as the hour goes by,
- * and a bright bead marks the hour. The digital time sits in the middle.
+ * A dial clock, tilted back for depth. The gold ticks fill as the hour passes, a bead marks the hour,
+ * and a comet with a fading tail sweeps the ring once a minute. The digital time sits in the middle.
  */
 @Composable
-fun DialClock(now: ZonedDateTime, size: Dp, secondZone: ZoneId?, onCycleZone: () -> Unit) {
+fun DialClock(now: ZonedDateTime, ticker: State<Long>, size: Dp, secondZone: ZoneId?, onCycleZone: () -> Unit, tilt: State<Offset>) {
     val context = LocalContext.current
     val is24h = android.text.format.DateFormat.is24HourFormat(context)
     val time = now.format(DateTimeFormatter.ofPattern(if (is24h) "HH:mm" else "h:mm", Locale.getDefault()))
@@ -153,14 +220,22 @@ fun DialClock(now: ZonedDateTime, size: Dp, secondZone: ZoneId?, onCycleZone: ()
             Canvas(
                 Modifier
                     .size(size)
-                    .graphicsLayer { rotationX = 22f; cameraDistance = 14f * density }
+                    .graphicsLayer {
+                        rotationX = 22f + tilt.value.y * 8f
+                        rotationY = tilt.value.x * 10f
+                        cameraDistance = 14f * density
+                    }
             ) {
                 val r = this.size.minDimension / 2
                 val c = Offset(this.size.width / 2, this.size.height / 2)
+                fun at(angle: Double, radius: Float) = Offset(c.x + radius * cos(angle).toFloat(), c.y + radius * sin(angle).toFloat())
+
+                // A faint glow under the whole dial.
+                drawCircle(Brush.radialGradient(listOf(Gold.copy(alpha = 0.10f), Color.Transparent), c, r * 1.1f), r * 1.1f, c)
+
                 for (i in 0 until 60) {
                     val a = (i / 60.0) * 2 * PI - PI / 2
                     val major = i % 5 == 0
-                    val inner = r * if (major) 0.80f else 0.87f
                     val lit = i <= now.minute
                     val color = when {
                         lit -> Gold
@@ -168,17 +243,23 @@ fun DialClock(now: ZonedDateTime, size: Dp, secondZone: ZoneId?, onCycleZone: ()
                         else -> Cream.copy(alpha = 0.15f)
                     }
                     drawLine(
-                        color,
-                        Offset(c.x + inner * cos(a).toFloat(), c.y + inner * sin(a).toFloat()),
-                        Offset(c.x + r * 0.96f * cos(a).toFloat(), c.y + r * 0.96f * sin(a).toFloat()),
-                        strokeWidth = if (major) 3.dp.toPx() else 1.5.dp.toPx(),
-                        cap = StrokeCap.Round,
+                        color, at(a, r * if (major) 0.80f else 0.87f), at(a, r * 0.96f),
+                        strokeWidth = if (major) 3.dp.toPx() else 1.5.dp.toPx(), cap = StrokeCap.Round,
                     )
                 }
+
+                // The seconds comet.
+                val ms = ticker.value % 60_000
+                val head = (ms / 60_000.0) * 2 * PI - PI / 2
+                for (k in 0 until 18) {
+                    val a = head - k * 0.035
+                    drawCircle(Gold.copy(alpha = (1f - k / 18f) * 0.55f), (3.2f - k * 0.15f).dp.toPx(), at(a, r * 1.03f))
+                }
+                drawCircle(Cream, 2.6.dp.toPx(), at(head, r * 1.03f))
+
                 val ha = ((now.hour % 12 + now.minute / 60.0) / 12.0) * 2 * PI - PI / 2
-                val hr = r * 0.70f
-                drawCircle(Gold.copy(alpha = 0.25f), 9.dp.toPx(), Offset(c.x + hr * cos(ha).toFloat(), c.y + hr * sin(ha).toFloat()))
-                drawCircle(Gold, 4.dp.toPx(), Offset(c.x + hr * cos(ha).toFloat(), c.y + hr * sin(ha).toFloat()))
+                drawCircle(Gold.copy(alpha = 0.25f), 9.dp.toPx(), at(ha, r * 0.70f))
+                drawCircle(Gold, 4.dp.toPx(), at(ha, r * 0.70f))
             }
             Column(horizontalAlignment = Alignment.CenterHorizontally) {
                 Text(time, color = Cream, fontSize = (size.value / 4.2f).sp, fontWeight = FontWeight.Light)
