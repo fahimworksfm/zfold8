@@ -14,7 +14,15 @@ import androidx.lifecycle.lifecycleScope
 import androidx.lifecycle.repeatOnLifecycle
 import androidx.window.layout.FoldingFeature
 import androidx.window.layout.WindowInfoTracker
+import android.content.ClipData
+import android.content.ClipboardManager
+import android.net.Uri
+import android.widget.Toast
+import fm.fahim.foldlauncher.ui.AppActions
+import fm.fahim.foldlauncher.ui.GarageActions
+import fm.fahim.foldlauncher.ui.LauncherInputs
 import fm.fahim.foldlauncher.ui.LauncherScreen
+import java.time.ZoneId
 import kotlinx.coroutines.launch
 
 class MainActivity : ComponentActivity() {
@@ -27,6 +35,10 @@ class MainActivity : ComponentActivity() {
     private var learnTick by mutableStateOf(0) // bumps after every launch so predictions refresh
     private var resetTick by mutableStateOf(0) // bumps when Home is pressed while already home
     private var stopWatching: (() -> Unit)? = null
+    private lateinit var projectStore: ProjectStore
+    private var projects by mutableStateOf<List<Project>>(emptyList())
+    private val prefs by lazy { getSharedPreferences("fold", MODE_PRIVATE) }
+    private var zoneIndex by mutableStateOf(0)
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
@@ -34,6 +46,9 @@ class MainActivity : ComponentActivity() {
         repo = AppRepository(this)
         usage = UsageModel(this)
         hidden = usage.hiddenKeys.toSet()
+        projectStore = ProjectStore(this)
+        projects = projectStore.load()
+        zoneIndex = prefs.getInt("zone", 0).coerceIn(0, ZONES.size - 1)
 
         reloadApps()
         stopWatching = repo.watch { reloadApps() }
@@ -54,33 +69,75 @@ class MainActivity : ComponentActivity() {
 
         setContent {
             LauncherScreen(
-                apps = apps,
-                hidden = hidden,
-                fold = fold,
-                resetTick = resetTick,
-                scores = { posture -> learnTick.let { usage.scores(posture) } },
-                counts = { learnTick.let { usage.counts() } },
-                onLaunch = { app, posture ->
-                    runCatching { repo.launch(app) }
-                    usage.record(app.key, posture)
-                    learnTick++
-                },
-                onAppInfo = { runCatching { repo.openAppInfo(it) } },
-                onUninstall = { app ->
-                    runCatching {
-                        startActivity(Intent(Intent.ACTION_DELETE, "package:${app.component.packageName}".toUri()))
-                    }
-                },
-                onSetHidden = { app, h ->
-                    usage.setHidden(app.key, h)
-                    hidden = usage.hiddenKeys.toSet()
-                },
-                onForget = { app ->
-                    usage.forget(app.key)
-                    learnTick++
-                },
-                isWork = repo::isWorkProfile,
+                LauncherInputs(
+                    apps = apps,
+                    hidden = hidden,
+                    projects = projects,
+                    fold = fold,
+                    resetTick = resetTick,
+                    secondZone = ZONES[zoneIndex]?.let(ZoneId::of),
+                    onCycleZone = {
+                        zoneIndex = (zoneIndex + 1) % ZONES.size
+                        prefs.edit().putInt("zone", zoneIndex).apply()
+                    },
+                    scores = { posture -> learnTick.let { usage.scores(posture) } },
+                    counts = { learnTick.let { usage.counts() } },
+                    onLaunch = { app, posture ->
+                        runCatching { repo.launch(app) }
+                        usage.record(app.key, posture)
+                        learnTick++
+                    },
+                    appActions = { launch ->
+                        AppActions(
+                            launch = launch,
+                            info = { runCatching { repo.openAppInfo(it) } },
+                            uninstall = { app ->
+                                runCatching { startActivity(Intent(Intent.ACTION_DELETE, Uri.parse("package:${app.component.packageName}"))) }
+                            },
+                            setHidden = { app, h -> usage.setHidden(app.key, h); hidden = usage.hiddenKeys.toSet() },
+                            forget = { app -> usage.forget(app.key); learnTick++ },
+                            isHidden = { it.key in hidden },
+                            isWork = repo::isWorkProfile,
+                        )
+                    },
+                    garage = GarageActions(
+                        openUrl = ::openUrl,
+                        askClaude = ::askClaude,
+                        save = { p ->
+                            val i = projects.indexOfFirst { it.id == p.id }
+                            projects = if (i >= 0) projects.toMutableList().also { it[i] = p } else projects + p
+                            projectStore.save(projects)
+                        },
+                        delete = { p ->
+                            projects = projects.filterNot { it.id == p.id }
+                            projectStore.save(projects)
+                        },
+                    ),
+                )
             )
+        }
+    }
+
+    private fun openUrl(url: String) {
+        val full = if (url.startsWith("http")) url else "https://$url"
+        runCatching { startActivity(Intent(Intent.ACTION_VIEW, Uri.parse(full))) }
+            .onFailure { Toast.makeText(this, "Couldn't open $full", Toast.LENGTH_SHORT).show() }
+    }
+
+    /** Hands the project to the Claude app, with its repo, so a session can start from it. */
+    private fun askClaude(p: Project) {
+        val text = buildString {
+            append("Let's work on ${p.name}.")
+            if (p.repo.isNotBlank()) append(" Repo: ${p.repo}.")
+            if (p.live.isNotBlank()) append(" Live: ${p.live}.")
+            if (p.host.isNotBlank()) append(" Hosted on ${p.host}.")
+        }
+        val share = Intent(Intent.ACTION_SEND).setType("text/plain").putExtra(Intent.EXTRA_TEXT, text).setPackage(CLAUDE)
+        val opened = runCatching { startActivity(share) }.isSuccess ||
+            runCatching { startActivity(packageManager.getLaunchIntentForPackage(CLAUDE)!!) }.isSuccess
+        if (!opened) openUrl("https://claude.ai/code")
+        else {
+            getSystemService(ClipboardManager::class.java)?.setPrimaryClip(ClipData.newPlainText("project", text))
         }
     }
 
@@ -98,5 +155,10 @@ class MainActivity : ComponentActivity() {
         lifecycleScope.launch { apps = repo.load() }
     }
 
-    private fun String.toUri() = android.net.Uri.parse(this)
+    companion object {
+        private const val CLAUDE = "com.anthropic.claude"
+
+        /** Tap the small line under the clock to step through these. Dhaka first, then off. */
+        private val ZONES = listOf("Asia/Dhaka", "Europe/London", "Asia/Singapore", "America/Los_Angeles", null)
+    }
 }

@@ -1,12 +1,10 @@
 package fm.fahim.foldlauncher.ui
 
-import android.content.Intent
-import android.content.IntentFilter
-import android.os.BatteryManager
 import androidx.compose.animation.AnimatedContent
 import androidx.compose.foundation.ExperimentalFoundationApi
 import androidx.compose.foundation.Image
 import androidx.compose.foundation.background
+import androidx.compose.foundation.clickable
 import androidx.compose.foundation.combinedClickable
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
@@ -36,7 +34,6 @@ import androidx.compose.material3.darkColorScheme
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
-import androidx.compose.runtime.mutableLongStateOf
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.setValue
@@ -47,10 +44,10 @@ import androidx.compose.ui.focus.focusRequester
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.SolidColor
 import androidx.compose.ui.platform.LocalConfiguration
-import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.platform.LocalFocusManager
 import androidx.compose.ui.platform.LocalSoftwareKeyboardController
 import androidx.compose.ui.text.TextStyle
+import androidx.compose.ui.text.font.FontFamily
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.input.ImeAction
 import androidx.compose.ui.text.style.TextAlign
@@ -60,45 +57,53 @@ import androidx.compose.ui.unit.sp
 import androidx.window.layout.FoldingFeature
 import fm.fahim.foldlauncher.AppEntry
 import fm.fahim.foldlauncher.Posture
+import fm.fahim.foldlauncher.Project
 import fm.fahim.foldlauncher.Search
-import kotlinx.coroutines.delay
-import java.text.SimpleDateFormat
-import java.util.Date
-import java.util.Locale
+import java.time.ZoneId
 
-private val Ink = Color(0xFFF2F2F2)
-private val Muted = Color(0xFFA8A8A8)
-private val Accent = Color(0xFF9FD8FF)
-private val Scrim = Color(0x8C000000)
-private val Field = Color(0x26FFFFFF)
+private val Ink = Cream
+private val Muted = Dim
+private val Accent = Gold
+private val Field = Glass
 
-/** Everything an app cell can do, passed down once instead of as six lambdas. */
-class AppActions(
-    val launch: (AppEntry) -> Unit,
-    val info: (AppEntry) -> Unit,
-    val uninstall: (AppEntry) -> Unit,
-    val setHidden: (AppEntry, Boolean) -> Unit,
-    val forget: (AppEntry) -> Unit,
-    val isHidden: (AppEntry) -> Boolean,
-    val isWork: (AppEntry) -> Boolean,
+/**
+ * Apps for building and running the studio, in the order they appear in the Studio row.
+ * Only the ones installed on the phone are shown.
+ */
+private val STUDIO_PACKAGES = listOf(
+    "com.anthropic.claude",
+    "com.github.android",
+    "com.google.android.apps.bard",
+    "com.whatsapp.w4b",
+    "com.whatsapp",
+    "org.telegram.messenger",
+    "com.stripe.android.dashboard",
+    "com.android.chrome",
+    "com.termux",
 )
 
+/** All the state and callbacks the screen needs, gathered in one place. */
+class LauncherInputs(
+    val apps: List<AppEntry>,
+    val hidden: Set<String>,
+    val projects: List<Project>,
+    val fold: FoldingFeature?,
+    val resetTick: Int,
+    val secondZone: ZoneId?,
+    val onCycleZone: () -> Unit,
+    val scores: (Posture) -> Map<String, Double>,
+    val counts: () -> Map<String, Int>,
+    val onLaunch: (AppEntry, Posture) -> Unit,
+    val appActions: (launch: (AppEntry) -> Unit) -> AppActions,
+    val garage: GarageActions,
+)
+
+private enum class Tab { GARAGE, APPS }
+
 @Composable
-fun LauncherScreen(
-    apps: List<AppEntry>,
-    hidden: Set<String>,
-    fold: FoldingFeature?,
-    resetTick: Int,
-    scores: (Posture) -> Map<String, Double>,
-    counts: () -> Map<String, Int>,
-    onLaunch: (AppEntry, Posture) -> Unit,
-    onAppInfo: (AppEntry) -> Unit,
-    onUninstall: (AppEntry) -> Unit,
-    onSetHidden: (AppEntry, Boolean) -> Unit,
-    onForget: (AppEntry) -> Unit,
-    isWork: (AppEntry) -> Boolean,
-) {
+fun LauncherScreen(inputs: LauncherInputs) {
     val widthDp = LocalConfiguration.current.screenWidthDp
+    val fold = inputs.fold
     val posture = when {
         fold?.state == FoldingFeature.State.HALF_OPENED &&
             fold.orientation == FoldingFeature.Orientation.HORIZONTAL -> Posture.TABLETOP
@@ -108,6 +113,10 @@ fun LauncherScreen(
 
     var query by remember { mutableStateOf("") }
     var showAll by remember { mutableStateOf(false) }
+    var tab by remember { mutableStateOf(Tab.GARAGE) }
+    var sheet by remember { mutableStateOf<Project?>(null) }
+    var editing by remember { mutableStateOf<Project?>(null) }
+    var adding by remember { mutableStateOf(false) }
     val focus = LocalFocusManager.current
     val keyboard = LocalSoftwareKeyboardController.current
 
@@ -115,168 +124,161 @@ fun LauncherScreen(
         query = ""; showAll = false
         focus.clearFocus(); keyboard?.hide()
     }
-    LaunchedEffect(resetTick) { if (resetTick > 0) reset() }
+    LaunchedEffect(inputs.resetTick) { if (inputs.resetTick > 0) reset() }
 
-    val visible = apps.filter { it.key !in hidden }
-    val scoreMap = scores(posture)
-    val predicted = visible
-        .filter { (scoreMap[it.key] ?: 0.0) > 0.0 }
-        .sortedByDescending { scoreMap[it.key] }
+    val visible = inputs.apps.filter { it.key !in inputs.hidden }
+    val scoreMap = inputs.scores(posture)
+    val predicted = visible.filter { (scoreMap[it.key] ?: 0.0) > 0.0 }.sortedByDescending { scoreMap[it.key] }
+    val studio = STUDIO_PACKAGES.mapNotNull { pkg -> visible.firstOrNull { it.component.packageName == pkg } }
     // Search covers hidden apps too, so hiding never makes an app unreachable.
-    val results = if (query.isBlank()) emptyList() else Search.rank(query, apps, counts())
-
-    val actions = AppActions(
-        launch = { app -> onLaunch(app, posture); reset() },
-        info = onAppInfo,
-        uninstall = onUninstall,
-        setHidden = onSetHidden,
-        forget = onForget,
-        isHidden = { it.key in hidden },
-        isWork = isWork,
-    )
-    val search: @Composable (Modifier) -> Unit = { m ->
-        SearchField(query, { query = it }, onGo = { results.firstOrNull()?.let(actions.launch) }, modifier = m)
+    val results = if (query.isBlank()) emptyList() else Search.rank(query, inputs.apps, inputs.counts())
+    val projectHits = if (query.isBlank()) emptyList() else inputs.projects.filter {
+        it.name.contains(query.trim(), ignoreCase = true) ||
+            it.note.contains(query.trim(), ignoreCase = true) ||
+            it.host.equals(query.trim(), ignoreCase = true)
     }
 
-    MaterialTheme(colorScheme = darkColorScheme(primary = Accent)) {
+    val actions = inputs.appActions { app -> inputs.onLaunch(app, posture); reset() }
+    val openBay: (Project) -> Unit = { sheet = it }
+    val addBay: () -> Unit = { adding = true }
+    val search: @Composable (Modifier) -> Unit = { m ->
+        SearchField(
+            query, { query = it },
+            onGo = {
+                results.firstOrNull()?.let(actions.launch) ?: projectHits.firstOrNull()?.let { sheet = it }
+            },
+            modifier = m,
+        )
+    }
+    val now = rememberNow()
+    val night = isNightShift(now)
+    val clock: @Composable (Int) -> Unit = { size ->
+        Column(horizontalAlignment = Alignment.CenterHorizontally) {
+            if (night) NightShiftBadge() else Spacer(Modifier.height(16.dp))
+            DialClock(now, size.dp, inputs.secondZone, inputs.onCycleZone)
+        }
+    }
+
+    MaterialTheme(colorScheme = darkColorScheme(primary = Accent, surface = Color(0xFF1A1816))) {
         Box(
             Modifier
                 .fillMaxSize()
-                .background(Scrim)
+                .smokeBackground(night)
                 .safeDrawingPadding()
                 .imePadding()
         ) {
             AnimatedContent(targetState = posture, label = "posture") { p ->
                 when (p) {
-                    Posture.COVER -> CoverLayout(query, results, predicted, visible, showAll, { showAll = it }, actions, search)
-                    Posture.OPEN -> OpenLayout(query, results, predicted, visible, actions, search)
-                    Posture.TABLETOP -> TabletopLayout(query, results, predicted, actions, search)
+                    Posture.COVER -> Column(Modifier.fillMaxSize().padding(horizontal = 16.dp)) {
+                        when {
+                            query.isNotBlank() -> SearchResults(projectHits, results, 4, actions, openBay, Modifier.weight(1f))
+                            showAll -> {
+                                Header("All apps", trailing = "Close") { showAll = false }
+                                AppGrid(visible, columns = 4, actions = actions, modifier = Modifier.weight(1f))
+                            }
+                            else -> {
+                                Box(Modifier.fillMaxWidth().weight(1f), contentAlignment = Alignment.Center) { clock(200) }
+                                Header("Garage")
+                                GarageRow(inputs.projects, openBay, addBay)
+                                Header(if (predicted.isEmpty()) "Studio" else "Right now", trailing = "All apps") { showAll = true }
+                                AppGrid((predicted.ifEmpty { studio }).take(4), columns = 4, actions = actions, scroll = false)
+                            }
+                        }
+                        search(Modifier.fillMaxWidth().padding(vertical = 12.dp))
+                    }
+
+                    Posture.OPEN -> Row(Modifier.fillMaxSize().padding(16.dp)) {
+                        Column(Modifier.weight(0.38f).padding(end = 20.dp), horizontalAlignment = Alignment.CenterHorizontally) {
+                            clock(250)
+                            if (studio.isNotEmpty()) {
+                                Header("Studio")
+                                AppGrid(studio.take(6), columns = 3, actions = actions, scroll = false)
+                            }
+                            Header("Right now")
+                            if (predicted.isEmpty()) LearningHint()
+                            else AppGrid(predicted.take(9), columns = 3, actions = actions, modifier = Modifier.weight(1f))
+                        }
+                        Column(Modifier.weight(0.62f)) {
+                            search(Modifier.fillMaxWidth().padding(bottom = 8.dp))
+                            if (query.isNotBlank()) {
+                                SearchResults(projectHits, results, 5, actions, openBay, Modifier.weight(1f))
+                            } else {
+                                Row(Modifier.padding(vertical = 8.dp)) {
+                                    TabLabel("GARAGE  ${inputs.projects.size}", tab == Tab.GARAGE) { tab = Tab.GARAGE }
+                                    TabLabel("APPS  ${visible.size}", tab == Tab.APPS) { tab = Tab.APPS }
+                                }
+                                if (tab == Tab.GARAGE) GarageGrid(inputs.projects, 3, openBay, addBay, Modifier.weight(1f))
+                                else AppGrid(visible, columns = 5, actions = actions, modifier = Modifier.weight(1f))
+                            }
+                        }
+                    }
+
+                    Posture.TABLETOP -> Column(Modifier.fillMaxSize().padding(horizontal = 24.dp)) {
+                        Box(Modifier.weight(1f).fillMaxWidth(), contentAlignment = Alignment.Center) { clock(220) }
+                        Column(Modifier.weight(1f).padding(top = 12.dp)) {
+                            search(Modifier.fillMaxWidth().padding(bottom = 8.dp))
+                            if (query.isNotBlank()) SearchResults(projectHits, results, 6, actions, openBay, Modifier.weight(1f))
+                            else {
+                                GarageRow(inputs.projects, openBay, addBay)
+                                Spacer(Modifier.height(8.dp))
+                                AppGrid(predicted.ifEmpty { studio }.take(6), columns = 6, actions = actions, scroll = false)
+                            }
+                        }
+                    }
                 }
             }
+
+            sheet?.let { p -> ProjectSheet(p, inputs.garage, onEdit = { editing = p }, onDismiss = { sheet = null }) }
+            editing?.let { p -> EditProjectDialog(p, inputs.garage, onDismiss = { editing = null }) }
+            if (adding) EditProjectDialog(null, inputs.garage, onDismiss = { adding = false })
         }
     }
 }
 
-/** Folded: a narrow, one-handed screen. Clock, your next likely apps, search at thumb height. */
 @Composable
-private fun CoverLayout(
-    query: String,
-    results: List<AppEntry>,
-    predicted: List<AppEntry>,
-    all: List<AppEntry>,
-    showAll: Boolean,
-    setShowAll: (Boolean) -> Unit,
+private fun SearchResults(
+    projects: List<Project>,
+    apps: List<AppEntry>,
+    columns: Int,
     actions: AppActions,
-    search: @Composable (Modifier) -> Unit,
+    onOpen: (Project) -> Unit,
+    modifier: Modifier,
 ) {
-    Column(Modifier.fillMaxSize().padding(horizontal = 16.dp)) {
-        when {
-            query.isNotBlank() -> AppGrid(results, columns = 4, actions = actions, modifier = Modifier.weight(1f))
-            showAll -> {
-                Header("All apps", trailing = "Close") { setShowAll(false) }
-                AppGrid(all, columns = 4, actions = actions, modifier = Modifier.weight(1f))
-            }
-            else -> {
-                Spacer(Modifier.height(32.dp))
-                Clock(big = true)
-                Spacer(Modifier.weight(1f))
-                Header("Right now", trailing = "All apps") { setShowAll(true) }
-                if (predicted.isEmpty()) LearningHint()
-                else AppGrid(predicted.take(8), columns = 4, actions = actions, scroll = false)
-            }
+    Column(modifier) {
+        if (projects.isNotEmpty()) {
+            Header("Garage")
+            GarageRow(projects, onOpen, onAdd = {})
         }
-        search(Modifier.fillMaxWidth().padding(vertical = 12.dp))
-    }
-}
-
-/** Unfolded: two panes. Left is "now" (time and predictions), right is every app plus search. */
-@Composable
-private fun OpenLayout(
-    query: String,
-    results: List<AppEntry>,
-    predicted: List<AppEntry>,
-    all: List<AppEntry>,
-    actions: AppActions,
-    search: @Composable (Modifier) -> Unit,
-) {
-    Row(Modifier.fillMaxSize().padding(16.dp)) {
-        Column(Modifier.weight(0.42f).padding(end = 20.dp)) {
-            Spacer(Modifier.height(24.dp))
-            Clock(big = true)
-            Spacer(Modifier.height(40.dp))
-            Header("Right now")
-            if (predicted.isEmpty()) LearningHint()
-            else AppGrid(predicted.take(12), columns = 3, actions = actions, modifier = Modifier.weight(1f))
+        if (apps.isNotEmpty()) {
+            Header("Apps")
+            AppGrid(apps, columns = columns, actions = actions, modifier = Modifier.weight(1f))
         }
-        Column(Modifier.weight(0.58f)) {
-            search(Modifier.fillMaxWidth().padding(bottom = 12.dp))
-            if (query.isNotBlank()) AppGrid(results, columns = 5, actions = actions, modifier = Modifier.weight(1f))
-            else AppGrid(all, columns = 5, actions = actions, modifier = Modifier.weight(1f))
-        }
-    }
-}
-
-/** Half-open on a table: the top half is a glanceable clock, the bottom half is for your thumbs. */
-@Composable
-private fun TabletopLayout(
-    query: String,
-    results: List<AppEntry>,
-    predicted: List<AppEntry>,
-    actions: AppActions,
-    search: @Composable (Modifier) -> Unit,
-) {
-    Column(Modifier.fillMaxSize().padding(horizontal = 24.dp)) {
-        Box(Modifier.weight(1f).fillMaxWidth(), contentAlignment = Alignment.Center) {
-            Clock(big = true, center = true)
-        }
-        Column(Modifier.weight(1f).padding(top = 16.dp)) {
-            search(Modifier.fillMaxWidth().padding(bottom = 8.dp))
-            val list = if (query.isNotBlank()) results else predicted
-            if (list.isEmpty() && query.isBlank()) LearningHint()
-            else AppGrid(list, columns = 6, actions = actions, modifier = Modifier.weight(1f))
+        if (projects.isEmpty() && apps.isEmpty()) {
+            Text("Nothing by that name.", color = Muted, fontSize = 14.sp, modifier = Modifier.padding(vertical = 16.dp))
         }
     }
 }
 
 @Composable
-private fun Clock(big: Boolean, center: Boolean = false) {
-    val context = LocalContext.current
-    var now by remember { mutableLongStateOf(System.currentTimeMillis()) }
-    LaunchedEffect(Unit) {
-        while (true) {
-            now = System.currentTimeMillis()
-            delay(60_000 - now % 60_000) // wake exactly on the next minute
-        }
-    }
-    val battery = remember(now) {
-        context.registerReceiver(null, IntentFilter(Intent.ACTION_BATTERY_CHANGED))?.let { i ->
-            val level = i.getIntExtra(BatteryManager.EXTRA_LEVEL, -1)
-            val scale = i.getIntExtra(BatteryManager.EXTRA_SCALE, 100)
-            val charging = i.getIntExtra(BatteryManager.EXTRA_STATUS, -1) == BatteryManager.BATTERY_STATUS_CHARGING
-            if (level >= 0) "${level * 100 / scale}%" + if (charging) " charging" else "" else null
-        }
-    }
-    val is24h = android.text.format.DateFormat.is24HourFormat(context)
-    val time = SimpleDateFormat(if (is24h) "HH:mm" else "h:mm", Locale.getDefault()).format(Date(now))
-    val date = SimpleDateFormat("EEEE, d MMMM", Locale.getDefault()).format(Date(now))
-    val align = if (center) TextAlign.Center else TextAlign.Start
-
-    Column(horizontalAlignment = if (center) Alignment.CenterHorizontally else Alignment.Start) {
-        Text(time, color = Ink, fontSize = if (big) 72.sp else 40.sp, fontWeight = FontWeight.Light, textAlign = align)
-        Text(listOfNotNull(date, battery).joinToString("  ·  "), color = Muted, fontSize = 15.sp, textAlign = align)
-    }
+private fun TabLabel(text: String, selected: Boolean, onClick: () -> Unit) {
+    Text(
+        text, color = if (selected) Accent else Muted, fontSize = 12.sp, letterSpacing = 2.sp,
+        fontFamily = FontFamily.Monospace, fontWeight = if (selected) FontWeight.Bold else FontWeight.Normal,
+        modifier = Modifier.clickable(onClick = onClick).padding(end = 20.dp, top = 6.dp, bottom = 6.dp)
+    )
 }
 
 @Composable
 private fun Header(title: String, trailing: String? = null, onTrailing: () -> Unit = {}) {
     Row(Modifier.fillMaxWidth().padding(vertical = 8.dp), verticalAlignment = Alignment.CenterVertically) {
-        Text(title.uppercase(), color = Muted, fontSize = 12.sp, letterSpacing = 1.5.sp, modifier = Modifier.weight(1f))
+        Text(
+            title.uppercase(), color = Muted, fontSize = 11.sp, letterSpacing = 2.sp,
+            fontFamily = FontFamily.Monospace, modifier = Modifier.weight(1f)
+        )
         if (trailing != null) {
             Text(
-                trailing, color = Accent, fontSize = 14.sp,
-                modifier = Modifier
-                    .combinedClickable(onClick = onTrailing)
-                    .padding(horizontal = 8.dp, vertical = 6.dp)
+                trailing, color = Accent, fontSize = 13.sp,
+                modifier = Modifier.clickable(onClick = onTrailing).padding(horizontal = 8.dp, vertical = 6.dp)
             )
         }
     }
@@ -289,6 +291,18 @@ private fun LearningHint() {
         color = Muted, fontSize = 14.sp, modifier = Modifier.padding(vertical = 12.dp)
     )
 }
+
+/** Everything an app cell can do, passed down once instead of as six lambdas. */
+class AppActions(
+    val launch: (AppEntry) -> Unit,
+    val info: (AppEntry) -> Unit,
+    val uninstall: (AppEntry) -> Unit,
+    val setHidden: (AppEntry, Boolean) -> Unit,
+    val forget: (AppEntry) -> Unit,
+    val isHidden: (AppEntry) -> Boolean,
+    val isWork: (AppEntry) -> Boolean,
+)
+
 
 @Composable
 private fun SearchField(query: String, onChange: (String) -> Unit, onGo: () -> Unit, modifier: Modifier) {
